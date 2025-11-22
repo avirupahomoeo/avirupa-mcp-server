@@ -1,125 +1,142 @@
-// index.js
-const express = require('express');
-const bodyParser = require('body-parser');
-const axios = require('axios');
-const { createClient } = require('@supabase/supabase-js');
-const redis = require('redis');
-const jwt = require('jsonwebtoken');
-const NodeCache = require('node-cache');
+import express from "express";
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
+import axios from "axios";
+import Redis from "ioredis";
+import { createClient as createSupabaseClient } from "@supabase/supabase-js";
+import WooCommerceRestApi from "@woocommerce/woocommerce-rest-api";
 
+dotenv.config();
+
+const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(bodyParser.json());
 
-// env variables (set in Coolify)
-const {
-  PORT = 3000,
-  MCP_API_KEY,             // your static API key (or use JWT)
-  SUPABASE_URL,
-  SUPABASE_SERVICE_KEY,
-  WOOCONSUMER_KEY,
-  WOOCONSUMER_SECRET,
-  WOOSHOP_URL,             // https:/avirupahomoeo.com
-  ZOHO_CLIENT_ID,
-  ZOHO_CLIENT_SECRET,
-  ZOHO_REFRESH_TOKEN,
-  N8N_WEBHOOK_URL,         // https://n8n.avirupahomoeo.com/webhook/...
-  REDIS_URL,               // redis://default:pass@redis:6379
-  JWT_SECRET = "change_this_to_a_long_secret"
-} = process.env;
+// -------------------- Redis (short-term memory) --------------------
+const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
 
-// Supabase client
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+redis.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+redis.on("connect", () => {
+  console.log("Redis connected");
+});
 
-// Redis client (if REDIS_URL provided)
-let redisClient;
-if (REDIS_URL) {
-  // redis v4
-  redisClient = redis.createClient({ url: REDIS_URL });
-  redisClient.on('error', (err) => console.error('Redis error', err));
-  redisClient.connect().catch(err => console.error('Redis connect error', err));
+// -------------------- Supabase (persistent user data) --------------
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createSupabaseClient(supabaseUrl, supabaseKey);
+
+// -------------------- WooCommerce client --------------------------
+const woo = new WooCommerceRestApi({
+  url: process.env.WOOCOMERCE_BASE,
+  consumerKey: process.env.WOOCONSUMERKEY,
+  consumerSecret: process.env.WOOCONSUMERSECRET,
+  version: "wc/v3"
+});
+
+// -------------------- Utility helpers -----------------------------
+async function ensureUserInSupabase(user) {
+  // user = { phone, name, email, ... }
+  // For demo: table 'users' with unique phone
+  const { data, error } = await supabase
+    .from("users")
+    .select("*")
+    .eq("phone", user.phone)
+    .limit(1);
+
+  if (error) throw error;
+
+  if (data && data.length) {
+    // update
+    const upd = await supabase
+      .from("users")
+      .update(user)
+      .eq("phone", user.phone);
+    return upd.data?.[0] ?? data[0];
+  } else {
+    const ins = await supabase.from("users").insert(user).select().single();
+    return ins.data;
+  }
 }
 
-// local in-memory cache for tiny ephemeral memory
-const shortTerm = new NodeCache({ stdTTL: 60 * 60 }); // 1 hour
-
-// Basic API key middleware
-function requireApiKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.api_key;
-  if (!key) return res.status(401).json({ error: 'missing api key' });
-  if (key !== MCP_API_KEY) return res.status(403).json({ error: 'invalid key' });
-  next();
+async function getConversationMemory(sessionId) {
+  // Short-term memory stored in redis as JSON
+  const raw = await redis.get(`session:${sessionId}`);
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch (e) { return []; }
+}
+async function appendConversationMemory(sessionId, messageObj) {
+  const mem = await getConversationMemory(sessionId);
+  mem.push(messageObj);
+  await redis.set(`session:${sessionId}`, JSON.stringify(mem), "EX", 60 * 60 * 12); // 12h TTL
 }
 
-// Health
-app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
+// -------------------- Endpoints ----------------------------------
 
-// Example: get user memory (first check redis, then supabase)
-app.get('/user/:phone', requireApiKey, async (req, res) => {
+// Health / test
+app.get("/", (req, res) => {
+  res.send("MCP Server running!");
+});
+
+// Example: webhook that WhatsApp provider (Twilio) will POST to
+app.post("/webhook/whatsapp", async (req, res) => {
+  try {
+    // Twilio/other providers vary. Extract phone and message
+    const from = req.body.From || req.body.from || (req.body?.messages?.[0]?.from);
+    const body = req.body.Body || req.body.text || (req.body?.messages?.[0]?.text?.body);
+
+    // create a simple session id using phone
+    const sessionId = from.replace(/\D/g, "");
+
+    // append to memory
+    await appendConversationMemory(sessionId, { role: "user", text: body, time: Date.now() });
+
+    // check if message contains personal data (demo)
+    if (/my name is (.+)/i.test(body)) {
+      const name = body.match(/my name is (.+)/i)[1];
+      // store in supabase
+      const user = { phone: sessionId, name };
+      await ensureUserInSupabase(user);
+    }
+
+    // now call model provider or n8n to process message
+    // Example: call n8n
+    if (process.env.N8N_WEBHOOK_URL) {
+      await axios.post(process.env.N8N_WEBHOOK_URL, {
+        sessionId, from, body, receivedAt: Date.now()
+      }).catch(err => console.error("n8n webhook error", err?.toString()));
+    }
+
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send("ERR");
+  }
+});
+
+// Minimal endpoints so n8n or others can fetch user data
+app.get("/user/:phone", async (req, res) => {
   const phone = req.params.phone;
-  try {
-    // check redis short-term
-    if (redisClient) {
-      const cacheKey = `user:${phone}`;
-      const cached = await redisClient.get(cacheKey);
-      if (cached) return res.json({ source: 'redis', data: JSON.parse(cached) });
-    }
-    // fallback to Supabase
-    const { data, error } = await supabase.from('users').select('*').eq('phone', phone).limit(1).maybeSingle();
-    if (error) throw error;
-    // store in redis for 5 mins
-    if (redisClient && data) {
-      await redisClient.setEx(`user:${phone}`, 300, JSON.stringify(data));
-    }
-    res.json({ source: 'supabase', data });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || err });
-  }
+  const { data, error } = await supabase.from("users").select("*").eq("phone", phone).single();
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ user: data });
 });
 
-// Example: save or update user profile to Supabase
-app.post('/user', requireApiKey, async (req, res) => {
-  const payload = req.body; // { phone, name, dob, ... }
-  if (!payload || !payload.phone) return res.status(400).json({ error: 'phone required' });
-  try {
-    // upsert into supabase
-    const { data, error } = await supabase.from('users').upsert(payload).select().single();
-    if (error) throw error;
-    // update redis cache
-    if (redisClient) await redisClient.setEx(`user:${payload.phone}`, 300, JSON.stringify(data));
-    res.json({ ok: true, data });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || err });
-  }
+// Manual action for testing: push memory to model (example)
+app.post("/ask-model", async (req, res) => {
+  // req.body: { sessionId, prompt }
+  const { sessionId, prompt } = req.body;
+  const memory = await getConversationMemory(sessionId);
+  // Compose a request for model provider (OpenAI/Gemini/Groq) - placeholder
+  // Example: call OpenAI ChatCompletion
+  if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: "no OPENAI_API_KEY" });
+
+  // call OpenAI or another provider here (example uses axios)
+  // For now return memory + prompt
+  return res.json({ memory, prompt });
 });
 
-// Example: call WooCommerce product lookup (basic)
-app.get('/wc/product/:id', requireApiKey, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const url = `${WOOSHOP_URL}/wp-json/wc/v3/products/${id}`;
-    const auth = { username: WOOCONSUMER_KEY, password: WOOCONSUMER_SECRET };
-    const r = await axios.get(url, { auth });
-    res.json(r.data);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message || err }); }
+app.listen(PORT, () => {
+  console.log(`MCP server listening on port ${PORT}`);
 });
-
-// Example: trigger a workflow in n8n
-app.post('/trigger/n8n', requireApiKey, async (req, res) => {
-  try {
-    const body = req.body;
-    await axios.post(N8N_WEBHOOK_URL, body, { headers: { 'Content-Type': 'application/json' } });
-    res.json({ ok: true });
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message || err }); }
-});
-
-// Simple JWT creation (optional) for mobile/clients
-app.post('/auth/jwt', requireApiKey, (req, res) => {
-  const { sub } = req.body;
-  const token = jwt.sign({ sub }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token });
-});
-
-const port = process.env.PORT || PORT || 3000;
-app.listen(port, () => console.log('MCP listening on', port));
